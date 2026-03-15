@@ -239,6 +239,26 @@ impl<'db> AnalyzedClassInfo<'db> {
             typed_dict_runtime_match: TypedDictRuntimeMatch::all(elements),
         }
     }
+
+    fn constraint_for_narrowing(
+        &self,
+        db: &'db dyn Db,
+        first_arg_ty: Type<'db>,
+        is_positive: bool,
+    ) -> Type<'db> {
+        let constraint = if self.typed_dict_runtime_match == TypedDictRuntimeMatch::Always
+            && is_or_contains_typed_dict_like(db, first_arg_ty)
+        {
+            UnionBuilder::new(db)
+                .add(self.constraint)
+                .add(Type::TypedDictTop)
+                .build()
+        } else {
+            self.constraint
+        };
+
+        constraint.negate_if(db, !is_positive)
+    }
 }
 
 impl ClassInfoConstraintFunction {
@@ -417,53 +437,22 @@ impl ClassInfoConstraintFunction {
 }
 
 #[derive(Hash, PartialEq, Debug, Eq, Clone, salsa::Update, get_size2::GetSize)]
-enum AtomicNarrowingConstraint<'db> {
-    Type(Type<'db>),
-    TypedDictRuntimeAdjustment {
-        constraint: Type<'db>,
-        is_positive: bool,
-    },
-}
-
-impl<'db> AtomicNarrowingConstraint<'db> {
-    fn apply(self, db: &'db dyn Db, base_ty: Type<'db>) -> Type<'db> {
-        match self {
-            AtomicNarrowingConstraint::Type(constraint) => IntersectionBuilder::new(db)
-                .add_positive(base_ty)
-                .add_positive(constraint)
-                .build(),
-            AtomicNarrowingConstraint::TypedDictRuntimeAdjustment {
-                constraint,
-                is_positive,
-            } => {
-                let static_narrowed = IntersectionBuilder::new(db)
-                    .add_positive(base_ty)
-                    .add_positive(constraint.negate_if(db, !is_positive))
-                    .build();
-
-                apply_typed_dict_runtime_adjustment(db, base_ty, static_narrowed, is_positive)
-            }
-        }
-    }
-}
-
-#[derive(Hash, PartialEq, Debug, Eq, Clone, salsa::Update, get_size2::GetSize)]
 struct Conjunctions<'db> {
-    conjuncts: SmallVec<[AtomicNarrowingConstraint<'db>; 2]>,
+    conjuncts: SmallVec<[Type<'db>; 2]>,
 }
 
 impl<'db> Conjunctions<'db> {
-    fn singleton(constraint: AtomicNarrowingConstraint<'db>) -> Self {
+    fn singleton(constraint: Type<'db>) -> Self {
         Self {
             conjuncts: smallvec![constraint],
         }
     }
 
     fn and_with(mut self, other: Self) -> Self {
-        let has_never = |constraint: &AtomicNarrowingConstraint<'db>| matches!(constraint, AtomicNarrowingConstraint::Type(ty) if ty.is_never());
+        let has_never = |constraint: &Type<'db>| constraint.is_never();
 
         if self.conjuncts.iter().any(has_never) || other.conjuncts.iter().any(has_never) {
-            return Self::singleton(AtomicNarrowingConstraint::Type(Type::Never));
+            return Self::singleton(Type::Never);
         }
 
         for conjunct in other.conjuncts {
@@ -475,23 +464,11 @@ impl<'db> Conjunctions<'db> {
     }
 
     fn evaluate_constraint_type(self, db: &'db dyn Db, base_ty: Type<'db>) -> Type<'db> {
-        if self
-            .conjuncts
-            .iter()
-            .all(|conjunct| matches!(conjunct, AtomicNarrowingConstraint::Type(_)))
-        {
-            let mut intersection = IntersectionBuilder::new(db).add_positive(base_ty);
-            for conjunct in self.conjuncts {
-                if let AtomicNarrowingConstraint::Type(ty) = conjunct {
-                    intersection = intersection.add_positive(ty);
-                }
-            }
-            return intersection.build();
+        let mut intersection = IntersectionBuilder::new(db).add_positive(base_ty);
+        for conjunct in self.conjuncts {
+            intersection = intersection.add_positive(conjunct);
         }
-
-        self.conjuncts
-            .into_iter()
-            .fold(base_ty, |ty, conjunct| conjunct.apply(db, ty))
+        intersection.build()
     }
 }
 
@@ -535,9 +512,7 @@ impl<'db> NarrowingConstraint<'db> {
     /// intersected with this constraint
     pub(crate) fn intersection(constraint: Type<'db>) -> Self {
         Self {
-            intersection_disjuncts: smallvec_inline![Conjunctions::singleton(
-                AtomicNarrowingConstraint::Type(constraint),
-            )],
+            intersection_disjuncts: smallvec_inline![Conjunctions::singleton(constraint)],
             replacement_disjuncts: smallvec![],
         }
     }
@@ -547,30 +522,12 @@ impl<'db> NarrowingConstraint<'db> {
     fn replacement(constraint: Type<'db>) -> Self {
         Self {
             intersection_disjuncts: smallvec![],
-            replacement_disjuncts: smallvec_inline![Conjunctions::singleton(
-                AtomicNarrowingConstraint::Type(constraint),
-            )],
+            replacement_disjuncts: smallvec_inline![Conjunctions::singleton(constraint)],
         }
     }
 
-    fn classinfo(db: &'db dyn Db, classinfo: &AnalyzedClassInfo<'db>, is_positive: bool) -> Self {
-        if classinfo.typed_dict_runtime_match == TypedDictRuntimeMatch::Never {
-            Self::intersection(classinfo.constraint.negate_if(db, !is_positive))
-        } else {
-            Self::typed_dict_runtime_adjustment(classinfo.constraint, is_positive)
-        }
-    }
-
-    fn typed_dict_runtime_adjustment(constraint: Type<'db>, is_positive: bool) -> Self {
-        Self {
-            intersection_disjuncts: smallvec_inline![Conjunctions::singleton(
-                AtomicNarrowingConstraint::TypedDictRuntimeAdjustment {
-                    constraint,
-                    is_positive,
-                },
-            )],
-            replacement_disjuncts: smallvec![],
-        }
+    fn classinfo(constraint: Type<'db>) -> Self {
+        Self::intersection(constraint)
     }
 
     /// Merge two constraints, taking their intersection but respecting "replacement" semantics (with
@@ -1763,7 +1720,11 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                     .map(|classinfo| {
                         NarrowingConstraints::from_iter([(
                             place,
-                            NarrowingConstraint::classinfo(self.db, &classinfo, is_positive),
+                            NarrowingConstraint::classinfo(classinfo.constraint_for_narrowing(
+                                self.db,
+                                inference.expression_type(first_arg_node),
+                                is_positive,
+                            )),
                         )])
                     })
             }
@@ -2182,34 +2143,6 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         } else {
             None
         }
-    }
-}
-
-fn apply_typed_dict_runtime_adjustment<'db>(
-    db: &'db dyn Db,
-    base_ty: Type<'db>,
-    static_narrowed: Type<'db>,
-    is_positive: bool,
-) -> Type<'db> {
-    if !is_or_contains_typed_dict_like(db, base_ty) {
-        return static_narrowed;
-    }
-
-    if !is_positive {
-        IntersectionBuilder::new(db)
-            .add_positive(static_narrowed)
-            .add_negative(Type::TypedDictTop)
-            .build()
-    } else {
-        UnionBuilder::new(db)
-            .add(static_narrowed)
-            .add(
-                IntersectionBuilder::new(db)
-                    .add_positive(base_ty)
-                    .add_positive(Type::TypedDictTop)
-                    .build(),
-            )
-            .build()
     }
 }
 

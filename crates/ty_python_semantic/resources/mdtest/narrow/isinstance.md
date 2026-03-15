@@ -704,6 +704,18 @@ def _(z: int | Movie):
         reveal_type(z)  # revealed: int
 ```
 
+When a gradual arm remains after narrowing, the fallback is displayed as `Top[TypedDict]`.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def _(value: Movie | T):
+    if isinstance(value, dict):
+        reveal_type(value)  # revealed: Movie | (T@_ & Top[dict[Unknown, Unknown]]) | (T@_ & Top[TypedDict])
+```
+
 The behavior of `issubclass()` is similar.
 
 ```py
